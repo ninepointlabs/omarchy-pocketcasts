@@ -1,0 +1,1925 @@
+#!/usr/bin/python3 -I
+"""pocketcasts-bridge — the Pocket Casts and mpv helper behind the Omarchy Pocket Casts plugin.
+
+The QML side never talks HTTP or to the player itself. It runs this script
+with one subcommand per request and reads exactly one JSON object from stdout:
+
+    {"ok": true,  "data": ...}
+    {"ok": false, "code": "<machine code>", "error": "<human text>"}
+
+Handled failures (signed out, network, no player, ...) still exit 0 so the
+shell can branch on `code`; only an unexpected crash exits non-zero.
+
+Pocket Casts has no public API. This talks to the same endpoints the Pocket
+Casts web player uses (api.pocketcasts.com), which can change without notice.
+Login takes your email and password once, read from stdin, and keeps only the
+access and refresh tokens Pocket Casts hands back, in
+$XDG_STATE_HOME/omarchy-pocketcasts/auth.json (0600). The password is never
+written anywhere.
+
+Audio plays in mpv, started detached by this script and driven over its JSON
+IPC socket in $XDG_RUNTIME_DIR/omarchy-pocketcasts/ (0700). Playback outlives
+the shell; every `player` poll pushes the listening position back to Pocket
+Casts so your phone picks up where this machine left off, and the other way
+round. When mpv-mpris is installed, media keys and playerctl see it too.
+
+Trust boundaries: the bridge runs under an isolated interpreter
+(`/usr/bin/python3 -I`) with a scrubbed environment; mpv is an absolute path
+from root-owned system directories started with a rebuilt environment and
+--no-config; it is only ever handed http(s) URLs; every file the bridge reads
+or writes is opened relative to a held, checked directory descriptor without
+following symlinks; and every HTTP body is read against a byte cap and an
+overall deadline.
+
+Only Python's standard library is used.
+"""
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import http.client as http_client
+import json
+import pwd
+import re
+import os
+import secrets
+import socket
+import ssl
+import stat
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+from concurrent.futures import ThreadPoolExecutor
+
+API = "https://api.pocketcasts.com"
+PODCAST_API = "https://podcast-api.pocketcasts.com"
+ART_BASE = "https://static.pocketcasts.com/discover/images"
+USER_AGENT = "omarchy-pocketcasts/0.1 (+https://github.com/ninepointlabs/omarchy-pocketcasts)"
+
+HTTP_TIMEOUT = 15
+ART_TIMEOUT = 8
+ART_WORKERS = 8
+ART_SIZE = 200
+ART_MAX_BYTES = 8 * 1024 * 1024
+# API replies are JSON well below this; a show's full episode list (served
+# gzipped from a CDN) is the largest thing fetched, and is capped after
+# decompression too.
+API_MAX_BYTES = 4 * 1024 * 1024
+SHOW_MAX_BYTES = 24 * 1024 * 1024
+ERROR_MAX_BYTES = 64 * 1024
+# Hosts the bridge will talk to: the API with the bearer token, and the
+# episode-list CDN and artwork host without it.
+API_HOST = "api.pocketcasts.com"
+SHOW_HOSTS = ("podcast-api.pocketcasts.com", "podcasts.pocketcasts.com", "cache.pocketcasts.com")
+ART_HOST_RE = re.compile(r"^static\.pocketcasts\.com$")
+ART_NAME_RE = re.compile(r"^[0-9a-f]{28}\.jpg$")
+
+AUTH_MAX_BYTES = 64 * 1024
+STATE_MAX_BYTES = 64 * 1024
+
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+EMAIL_RE = re.compile(r"^[^@\s]{1,128}@[^@\s]{1,253}$")
+
+# Pocket Casts' playingStatus values.
+STATUS_UNPLAYED = 1
+STATUS_IN_PROGRESS = 2
+STATUS_PLAYED = 3
+
+# Push the position to Pocket Casts at most this often while playing.
+SYNC_INTERVAL = 30
+# Within this many seconds of the end counts as finished.
+FINISH_SLACK = 3
+# Extra mpv arguments; the test suite sets --ao=null here.
+MPV_EXTRA_ARGS = ()
+SPEEDS = (0.8, 1.0, 1.1, 1.2, 1.3, 1.5, 1.7, 2.0, 2.5, 3.0)
+
+
+def safe_uuid(value):
+    """Pocket Casts IDs are UUIDs. Anything else must not reach a URL path."""
+    s = str(value or "").strip().lower()
+    if not UUID_RE.match(s):
+        raise ApiError("bad_args", "Not a Pocket Casts ID: %r" % s[:40])
+    return s
+
+
+def safe_media_url(value):
+    """Episode audio can live on any host, so only the scheme is pinned:
+    http(s) and nothing mpv would treat as a protocol of its own (lavfi://,
+    av://, file paths, edl://...)."""
+    s = str(value or "").strip()
+    if not s or len(s) > 4096 or CONTROL_RE.search(s):
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(s)
+    except ValueError:
+        return ""
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return ""
+    return s
+
+# --------------------------------------------------------------------- output
+
+def out(data):
+    sys.stdout.write(json.dumps({"ok": True, "data": data}, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def fail(code, message, extra=None):
+    payload = {"ok": False, "code": code, "error": message}
+    if extra:
+        payload.update(extra)
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+class ApiError(Exception):
+    def __init__(self, code, message, status=0, retry_after=0):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+        self.retry_after = retry_after
+
+
+# --------------------------------------------------------------- environment
+#
+# Nothing the bridge starts is looked up through the session PATH, and nothing
+# it starts sees the session's environment. Programs come from a fixed list of
+# root-owned system directories, and each child gets a rebuilt environment
+# holding only what that child needs.
+
+# /usr/local/bin and anything under $HOME are deliberately absent: those are
+# the usual landing spots for a shadow binary.
+TRUSTED_BIN_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/run/current-system/sw/bin")
+TRUSTED_PATH = ":".join(TRUSTED_BIN_DIRS)
+
+# Directory variables, honoured only as clean absolute paths. XDG_RUNTIME_DIR
+# is also where mpv finds PipeWire/PulseAudio.
+PATH_ENV_NAMES = ("HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+                  "XDG_DATA_HOME", "XDG_RUNTIME_DIR")
+# What mpv-mpris needs to publish the player on the session bus.
+BUS_ENV_NAMES = ("USER", "LOGNAME", "LANG", "DBUS_SESSION_BUS_ADDRESS")
+ALLOWED_ENV_NAMES = PATH_ENV_NAMES + BUS_ENV_NAMES
+TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clean_env_value(name, value):
+    """`value` when it is a bounded single-line string (and, for a directory
+    variable, a normalized absolute path); "" for anything else."""
+    if not isinstance(value, str) or not value or len(value) > 4096 or CONTROL_RE.search(value):
+        return ""
+    if name in PATH_ENV_NAMES:
+        if not value.startswith("/") or value.startswith("//") or os.path.normpath(value) != value:
+            return ""
+    return value
+
+
+def scrub_environment():
+    """Replace the inherited environment with the allow-listed variables and a
+    fixed PATH before anything consults it — urllib's proxy lookup, ssl's
+    SSL_CERT_FILE, subprocess resolution. The interpreter itself already runs
+    with -I, so PYTHON* variables and user site-packages never applied."""
+    kept = {}
+    for name in ALLOWED_ENV_NAMES:
+        value = clean_env_value(name, os.environ.get(name))
+        if value:
+            kept[name] = value
+    os.environ.clear()
+    os.environ.update(kept)
+    os.environ["PATH"] = TRUSTED_PATH
+
+
+def child_env():
+    """The complete environment for mpv: the fixed PATH, the directory and
+    session-bus variables, and nothing else (LD_PRELOAD, BASH_ENV, exported
+    shell functions, proxies are never carried over)."""
+    env = {"PATH": TRUSTED_PATH}
+    for name in PATH_ENV_NAMES + BUS_ENV_NAMES:
+        value = clean_env_value(name, os.environ.get(name))
+        if value:
+            env[name] = value
+    return env
+
+
+def home():
+    return clean_env_value("HOME", os.environ.get("HOME")) or pwd.getpwuid(os.geteuid()).pw_dir
+
+
+def xdg_home(name, *fallback):
+    return clean_env_value(name, os.environ.get(name)) or os.path.join(home(), *fallback)
+
+
+def safe_chain(path, owners):
+    """True when every component of the absolute, symlink-free `path`, from /
+    down to and including its last one, exists, is owned by one of `owners`,
+    and is writable by nobody else. A root-owned sticky directory (/tmp,
+    /nix/store) is allowed along the way: nobody but an entry's owner can
+    rename or remove what is in it."""
+    parts = path.split("/")
+    for i in range(1, len(parts) + 1):
+        prefix = "/".join(parts[:i]) or "/"
+        try:
+            st = os.lstat(prefix)
+        except OSError:
+            return False
+        if stat.S_ISLNK(st.st_mode) or st.st_uid not in owners:
+            return False
+        if st.st_mode & 0o022 and not (st.st_uid == 0 and stat.S_ISDIR(st.st_mode) and st.st_mode & stat.S_ISVTX):
+            return False
+    return True
+
+
+def trusted_tool(name, dirs=TRUSTED_BIN_DIRS):
+    """Absolute path of `name` in the first trusted directory holding it, or ""
+    — never a PATH lookup. The file it resolves to, and every directory on the
+    way to it, must be root-owned and writable by nobody else."""
+    if not TOOL_NAME_RE.match(name or ""):
+        return ""
+    for directory in dirs:
+        candidate = directory + "/" + name
+        try:
+            st = os.stat(candidate)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111:
+            continue
+        if safe_chain(os.path.realpath(directory), (0,)) and safe_chain(os.path.realpath(candidate), (0,)):
+            return candidate
+    return ""
+
+
+# ------------------------------------------------------------ private files
+#
+# Every file the bridge touches lives below a directory it holds open by
+# descriptor, and every operation on it is relative to that descriptor, so a
+# pathname swapped afterwards cannot redirect a read or a write.
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY
+CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+MAX_SYMLINK_HOPS = 16
+ENTRY_NAME_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]{1,128}$")
+
+
+class UnsafePath(ApiError):
+    def __init__(self, message):
+        super().__init__("unsafe_path", message)
+
+
+class HeldDir:
+    """A directory held open by descriptor; `path` is only for messages and for
+    telling the panel where cover art landed."""
+
+    def __init__(self, fd, path):
+        self.fd = fd
+        self.path = path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def entry(self, name):
+        return self.path.rstrip("/") + "/" + name
+
+
+def _check_dir(st, where):
+    if not stat.S_ISDIR(st.st_mode):
+        raise UnsafePath("%s is not a directory" % where)
+    if st.st_uid not in (0, os.geteuid()):
+        raise UnsafePath("%s is owned by another user" % where)
+    if st.st_mode & 0o022 and not (st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
+        raise UnsafePath("%s is writable by other users" % where)
+
+
+def _open_child(parent_fd, name, where, create):
+    """Open one directory component below `parent_fd` without following a
+    symlink. Returns (fd, None), or (None, target) when the entry is a symlink,
+    so the caller decides whether one is acceptable there."""
+    try:
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if stat.S_ISLNK(st.st_mode):
+        if st.st_uid not in (0, os.geteuid()):
+            raise UnsafePath("%s is a symbolic link owned by another user" % where)
+        return None, os.readlink(name, dir_fd=parent_fd)
+    try:
+        fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+    except OSError as err:
+        if err.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise UnsafePath("%s changed while it was being opened" % where)
+        raise
+    try:
+        held = os.fstat(fd)
+        if (held.st_dev, held.st_ino) != (st.st_dev, st.st_ino):
+            raise UnsafePath("%s changed while it was being opened" % where)
+        _check_dir(held, where)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, None
+
+
+def open_dir(base, owned=(), create=False):
+    """Hold `base`/`owned...` open and return it as a HeldDir.
+
+    `base` (an XDG directory, or one below it) is walked from / one component
+    at a time. Each directory must be owned by root or by you and writable by
+    nobody else. A symlink along `base` is followed only if it is yours or
+    root's, and then everything it leads through passes the same checks — so a
+    dotfile manager's symlinked ~/.config keeps working while a link into
+    someone else's directory does not.
+
+    The `owned` components below it belong to this plugin: each must be a real
+    directory (never a symlink) owned by you, and is tightened to 0700 when
+    `create` is set. Missing components are created 0700 only with `create`;
+    otherwise FileNotFoundError propagates."""
+    if not isinstance(base, str) or not base.startswith("/") or "\x00" in base:
+        raise UnsafePath("Not an absolute directory: %r" % (base,))
+    stack = [os.open("/", DIR_FLAGS)]
+    names = []
+    try:
+        _check_dir(os.fstat(stack[0]), "/")
+        pending = [part for part in reversed(base.split("/")) if part]
+        hops = 0
+        while pending:
+            name = pending.pop()
+            if name == ".":
+                continue
+            if name == "..":
+                if len(stack) > 1:
+                    os.close(stack.pop())
+                    names.pop()
+                continue
+            where = "/" + "/".join(names + [name])
+            fd, target = _open_child(stack[-1], name, where, create)
+            if target is not None:
+                hops += 1
+                if hops > MAX_SYMLINK_HOPS:
+                    raise UnsafePath("Too many symbolic links under %s" % base)
+                if target.startswith("/"):
+                    while len(stack) > 1:
+                        os.close(stack.pop())
+                    names = []
+                pending.extend(part for part in reversed(target.split("/")) if part)
+                continue
+            stack.append(fd)
+            names.append(name)
+        for name in owned:
+            if not ENTRY_NAME_RE.match(name):
+                raise UnsafePath("Bad directory name: %r" % (name,))
+            where = "/" + "/".join(names + [name])
+            fd, target = _open_child(stack[-1], name, where, create)
+            if target is not None:
+                raise UnsafePath("%s is a symbolic link" % where)
+            stack.append(fd)
+            names.append(name)
+            st = os.fstat(fd)
+            if st.st_uid != os.geteuid():
+                raise UnsafePath("%s is not owned by you" % where)
+            if create and st.st_mode & 0o077:
+                os.fchmod(fd, 0o700)
+        return HeldDir(stack.pop(), "/" + "/".join(names))
+    finally:
+        for fd in stack:
+            os.close(fd)
+
+
+def read_file_at(held, name, limit, private):
+    """The bytes of regular file `name` below `held`, or None when there is no
+    such entry. Refused with UnsafePath: a symlink (O_NOFOLLOW), a FIFO, socket
+    or device (opened non-blocking so it cannot hang, then rejected by type), a
+    file owned by someone else or with a second hard link, one others can write
+    — or, when `private`, read — and anything larger than `limit` bytes, which
+    is never read past limit + 1."""
+    where = held.entry(name)
+    if not ENTRY_NAME_RE.match(name):
+        raise UnsafePath("Bad file name: %r" % (name,))
+    try:
+        fd = os.open(name, READ_FLAGS, dir_fd=held.fd)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        if err.errno == errno.ELOOP:
+            raise UnsafePath("%s is a symbolic link" % where)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise UnsafePath("%s is not a regular file" % where)
+        if st.st_uid != os.geteuid():
+            raise UnsafePath("%s is not owned by you" % where)
+        if st.st_nlink != 1:
+            raise UnsafePath("%s has more than one hard link" % where)
+        if st.st_mode & (0o077 if private else 0o022):
+            raise UnsafePath("%s is open to other users (mode %o) — chmod 600 it"
+                             % (where, stat.S_IMODE(st.st_mode)))
+        if st.st_size > limit:
+            raise UnsafePath("%s is larger than %d bytes" % (where, limit))
+        chunks = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > limit:
+            raise UnsafePath("%s is larger than %d bytes" % (where, limit))
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_file_at(held, name, data, mode=0o600):
+    """Atomically replace `name` below `held` with `data`.
+
+    The content goes into a fresh, unpredictably named temp file created with
+    O_CREAT|O_EXCL|O_NOFOLLOW at 0600 — so nothing planted in advance can be
+    written through — then fsynced and renamed over `name` within the same held
+    directory. rename(2) replaces a directory entry and never follows one. An
+    existing `name` that is not a regular file you own (a symlink, a FIFO,
+    someone else's file) is refused rather than replaced. The temp file is
+    removed on any failure."""
+    where = held.entry(name)
+    if not ENTRY_NAME_RE.match(name):
+        raise UnsafePath("Bad file name: %r" % (name,))
+    try:
+        st = os.stat(name, dir_fd=held.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        st = None
+    if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()):
+        raise UnsafePath("Refusing to replace %s: it is not a regular file you own" % where)
+    tmp = ".%s.%s.tmp" % (name, secrets.token_hex(12))
+    fd = os.open(tmp, CREATE_FLAGS, 0o600, dir_fd=held.fd)
+    try:
+        try:
+            os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=held.fd, dst_dir_fd=held.fd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=held.fd)
+        except OSError:
+            pass
+        raise
+    try:
+        os.fsync(held.fd)
+    except OSError:
+        pass
+
+
+def unlink_at(held, name):
+    """Remove the entry itself (a symlink is removed, never followed)."""
+    try:
+        os.unlink(name, dir_fd=held.fd)
+        return True
+    except OSError:
+        return False
+
+
+def lexists_at(held, name):
+    try:
+        os.stat(name, dir_fd=held.fd, follow_symlinks=False)
+        return True
+    except OSError:
+        return False
+
+
+
+# ------------------------------------------------------------------ http core
+
+class ResponseTooLarge(ApiError):
+    def __init__(self, limit):
+        super().__init__("too_large", "Pocket Casts sent a reply larger than %d bytes; it was refused" % limit)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect automatically: following one would copy the
+    bearer token onto the new request and read the redirect body without a
+    limit. The one place Pocket Casts redirects (a show's episode list) is
+    followed by hand, host-checked and without the token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def build_opener(allow_plain_http=False):
+    """An opener with HTTPS and nothing else: no proxies taken from the
+    environment, no redirects, no file:, ftp: or data: handlers."""
+    opener = urllib.request.OpenerDirector()
+    handlers = [
+        urllib.request.UnknownHandler(),
+        urllib.request.HTTPDefaultErrorHandler(),
+        NoRedirect(),
+        urllib.request.HTTPErrorProcessor(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    ]
+    if allow_plain_http:  # the test suite's local server only
+        handlers.append(urllib.request.HTTPHandler())
+    for handler in handlers:
+        opener.add_handler(handler)
+    return opener
+
+
+_OPENER = None
+_OPENER_LOCK = threading.Lock()
+
+
+def opener():
+    global _OPENER
+    with _OPENER_LOCK:
+        if _OPENER is None:
+            _OPENER = build_opener()
+        return _OPENER
+
+
+def read_bounded(stream, limit, headers=None, deadline=None):
+    """A whole HTTP body, but never more than `limit` bytes: refused up front
+    when Content-Length already exceeds it, otherwise read in chunks and
+    abandoned at the first byte past it. `deadline` (time.monotonic) bounds
+    the whole read, so a server trickling bytes under the socket timeout still
+    cannot hold the bridge open."""
+    length = headers.get("Content-Length") if headers is not None else None
+    if length is not None:
+        try:
+            declared = int(str(length).strip())
+        except ValueError:
+            declared = -1
+        if declared > limit:
+            raise ResponseTooLarge(limit)
+    read = getattr(stream, "read1", None) or stream.read
+    chunks = []
+    total = 0
+    while True:
+        if deadline is not None and time.monotonic() > deadline:
+            raise ApiError("network", "Pocket Casts took too long to answer")
+        chunk = read(min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise ResponseTooLarge(limit)
+    return b"".join(chunks)
+
+
+def http_raw(method, url, headers=None, data=None, timeout=HTTP_TIMEOUT, limit=API_MAX_BYTES):
+    """Return (status, body_bytes, headers). Never raises for HTTP status codes;
+    raises ApiError for transport failures and for any body — success or error
+    — over its cap."""
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("User-Agent", USER_AGENT)
+    for key, value in (headers or {}).items():
+        req.add_header(key, value)
+    deadline = time.monotonic() + 2 * timeout
+    try:
+        with opener().open(req, timeout=timeout) as resp:
+            return resp.status, read_bounded(resp, limit, resp.headers, deadline), dict(resp.headers)
+    except urllib.error.HTTPError as err:
+        try:
+            body = read_bounded(err, min(limit, ERROR_MAX_BYTES), err.headers, deadline)
+        except (OSError, http_client.HTTPException):
+            body = b""
+        finally:
+            err.close()
+        return err.code, body, dict(err.headers or {})
+    except urllib.error.URLError as err:
+        raise ApiError("network", "Pocket Casts is unreachable: %s" % getattr(err, "reason", err))
+    except (TimeoutError, OSError, http_client.HTTPException) as err:
+        raise ApiError("network", "Pocket Casts request failed (%s)" % err)
+
+
+def http(method, url, headers=None, data=None, timeout=HTTP_TIMEOUT, limit=API_MAX_BYTES):
+    """Return (status, body_text, headers); see http_raw."""
+    status, body, resp_headers = http_raw(method, url, headers, data, timeout, limit)
+    return status, body.decode("utf-8", "replace"), resp_headers
+
+
+
+# ----------------------------------------------------------------- state store
+
+def state_dir(create=False):
+    return open_dir(xdg_home("XDG_STATE_HOME", ".local", "state"), ("omarchy-pocketcasts",), create)
+
+
+def load_json_at(held, name, limit, private):
+    blob = read_file_at(held, name, limit, private)
+    if not blob:
+        return {}
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_state(name, limit=STATE_MAX_BYTES):
+    """A private JSON file from the state directory, or {} when there is none.
+    One that is a symlink, not yours, open to other users, hard-linked or
+    oversized raises UnsafePath: it is neither read nor silently ignored."""
+    try:
+        with state_dir() as held:
+            return load_json_at(held, name, limit, private=True)
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(name, data):
+    blob = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    with state_dir(create=True) as held:
+        write_file_at(held, name, blob, 0o600)
+
+
+def drop_state(name):
+    try:
+        with state_dir() as held:
+            unlink_at(held, name)
+    except FileNotFoundError:
+        pass
+
+
+def load_auth():
+    return load_state("auth.json", AUTH_MAX_BYTES)
+
+
+def save_auth(auth):
+    save_state("auth.json", auth)
+
+
+def clear_auth():
+    drop_state("auth.json")
+
+
+class StateLock:
+    """An exclusive flock on the state directory's lock file, so a player poll
+    and a click never both decide what plays next."""
+
+    def __init__(self, timeout=10.0):
+        self.timeout = timeout
+        self.fd = -1
+
+    def __enter__(self):
+        with state_dir(create=True) as held:
+            self.fd = os.open("lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=held.fd)
+        st = os.fstat(self.fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            os.close(self.fd)
+            raise UnsafePath("The lock file is not a regular file you own")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    os.close(self.fd)
+                    raise ApiError("busy", "Another Pocket Casts action is still running")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+# ------------------------------------------------------------------ pocket casts
+
+def url_host_is(url, hosts):
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and not parts.username and not parts.password
+            and port in (None, 443) and (parts.hostname or "") in hosts)
+
+
+def gunzip_bounded(blob, limit):
+    """Decompress a gzip body without ever holding more than `limit` bytes."""
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        data = inflater.decompress(blob, limit + 1)
+    except zlib.error:
+        raise ApiError("bad_response", "Pocket Casts sent a corrupt compressed reply")
+    if len(data) > limit or inflater.unconsumed_tail:
+        raise ResponseTooLarge(limit)
+    return data
+
+
+def decode_body(blob, headers):
+    encoding = ""
+    for key, value in (headers or {}).items():
+        if key.lower() == "content-encoding":
+            encoding = str(value).lower().strip()
+    if encoding == "gzip" or blob[:2] == b"\x1f\x8b":
+        return gunzip_bounded(blob, SHOW_MAX_BYTES)
+    return blob
+
+
+def parse_json(blob, what="Pocket Casts"):
+    try:
+        return json.loads(blob.decode("utf-8")) if blob else {}
+    except (UnicodeDecodeError, ValueError):
+        raise ApiError("bad_response", "%s sent something that is not JSON" % what)
+
+
+def error_text(payload, status):
+    if isinstance(payload, dict):
+        for key in ("errorMessage", "message", "error_description", "error"):
+            if isinstance(payload.get(key), str) and payload[key].strip():
+                return payload[key].strip()[:200]
+    return "Pocket Casts request failed (HTTP %d)" % status
+
+
+def post_json(path, body, token=""):
+    """POST a JSON body to the API. Returns (status, payload)."""
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "Accept-Encoding": "gzip"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    data = json.dumps(body if body is not None else {}).encode("utf-8")
+    status, blob, resp_headers = http_raw("POST", API + path, headers, data)
+    blob = decode_body(blob, resp_headers)
+    try:
+        payload = json.loads(blob.decode("utf-8")) if blob else {}
+    except (UnicodeDecodeError, ValueError):
+        payload = {}
+    return status, payload
+
+
+def store_tokens(auth, payload):
+    auth["access_token"] = str(payload.get("accessToken") or "")
+    if payload.get("refreshToken"):
+        auth["refresh_token"] = str(payload["refreshToken"])
+    auth["expires_at"] = time.time() + float(payload.get("expiresIn") or 3600)
+    if payload.get("email"):
+        auth["email"] = str(payload["email"])[:256]
+    if payload.get("uuid"):
+        auth["uuid"] = str(payload["uuid"])[:64]
+    auth.pop("needs_reauth", None)
+    save_auth(auth)
+
+
+def refresh_tokens(auth):
+    status, payload = post_json("/user/token", {"grantType": "refresh_token",
+                                                "refreshToken": auth.get("refresh_token", "")})
+    if status == 200 and payload.get("accessToken"):
+        store_tokens(auth, payload)
+        return auth["access_token"]
+    if status in (400, 401, 403):
+        auth["needs_reauth"] = True
+        save_auth(auth)
+        raise ApiError("reauth", "Pocket Casts session expired — sign in again")
+    raise ApiError("network", error_text(payload, status), status)
+
+
+def access_token(auth, force_refresh=False):
+    if not auth.get("refresh_token") and not auth.get("access_token"):
+        raise ApiError("signed_out", "Not signed in to Pocket Casts")
+    if auth.get("needs_reauth"):
+        raise ApiError("reauth", "Pocket Casts session expired — sign in again")
+    if not force_refresh and auth.get("access_token") and time.time() < float(auth.get("expires_at", 0)) - 60:
+        return auth["access_token"]
+    if not auth.get("refresh_token"):
+        auth["needs_reauth"] = True
+        save_auth(auth)
+        raise ApiError("reauth", "Pocket Casts session expired — sign in again")
+    return refresh_tokens(auth)
+
+
+_AUTH = None
+
+
+def api(path, body=None):
+    """An authenticated API call. Retries once with fresh tokens on a 401."""
+    global _AUTH
+    if _AUTH is None:
+        _AUTH = load_auth()
+    token = access_token(_AUTH)
+    status, payload = post_json(path, body, token)
+    if status == 401:
+        token = access_token(_AUTH, force_refresh=True)
+        status, payload = post_json(path, body, token)
+        if status == 401:
+            _AUTH["needs_reauth"] = True
+            save_auth(_AUTH)
+            raise ApiError("reauth", "Pocket Casts session expired — sign in again")
+    if status == 429:
+        raise ApiError("rate_limited", "Pocket Casts asked us to slow down", status, 30)
+    if status >= 400:
+        raise ApiError("api", error_text(payload, status), status)
+    return payload if isinstance(payload, dict) else {}
+
+
+def fetch_show(podcast_uuid):
+    """The public episode list for a show. The API answers with a redirect to
+    a gzipped file on Pocket Casts' CDN; up to three hops are followed, each
+    only to an https Pocket Casts host and never with the bearer token."""
+    url = "%s/podcast/full/%s" % (PODCAST_API, safe_uuid(podcast_uuid))
+    for _ in range(4):
+        if not url_host_is(url, SHOW_HOSTS):
+            raise ApiError("bad_response", "Pocket Casts redirected somewhere unexpected")
+        status, blob, headers = http_raw("GET", url, {"Accept": "application/json", "Accept-Encoding": "gzip"},
+                                         limit=SHOW_MAX_BYTES)
+        if status in (301, 302, 303, 307, 308):
+            location = ""
+            for key, value in headers.items():
+                if key.lower() == "location":
+                    location = str(value)
+            url = urllib.parse.urljoin(url, location)
+            continue
+        if status == 404:
+            raise ApiError("not_found", "Pocket Casts has no episode list for that show")
+        if status != 200:
+            raise ApiError("api", "Pocket Casts could not list that show's episodes (HTTP %d)" % status, status)
+        data = parse_json(decode_body(blob, headers))
+        podcast = data.get("podcast") if isinstance(data, dict) else None
+        if not isinstance(podcast, dict):
+            raise ApiError("bad_response", "Pocket Casts sent an episode list without a show")
+        return podcast
+    raise ApiError("bad_response", "Pocket Casts redirected too many times")
+
+
+# ------------------------------------------------------------------ artwork
+
+def podcast_art(podcast_uuid):
+    if not podcast_uuid or not UUID_RE.match(str(podcast_uuid)):
+        return ""
+    return "%s/%d/%s.jpg" % (ART_BASE, ART_SIZE, str(podcast_uuid).lower())
+
+
+def art_url_allowed(url):
+    """HTTPS to Pocket Casts' artwork host on the default port, no credentials."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and not parts.username and not parts.password
+            and port in (None, 443) and bool(ART_HOST_RE.match(parts.hostname or "")))
+
+
+_ART_DIR = None
+_ART_DIR_LOCK = threading.Lock()
+
+
+def art_dir():
+    """The cover cache, held open for the life of the process so the download
+    workers all write relative to one checked descriptor."""
+    global _ART_DIR
+    with _ART_DIR_LOCK:
+        if _ART_DIR is None:
+            _ART_DIR = open_dir(xdg_home("XDG_CACHE_HOME", ".cache"), ("omarchy-pocketcasts", "art"), create=True)
+        return _ART_DIR
+
+
+def cache_one(url):
+    if not art_url_allowed(url):
+        return ""
+    name = hashlib.sha1(url.encode("utf-8")).hexdigest()[:28] + ".jpg"
+    try:
+        held = art_dir()
+        try:
+            st = os.stat(name, dir_fd=held.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            if (stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and st.st_nlink == 1
+                    and not st.st_mode & 0o022 and 0 < st.st_size <= ART_MAX_BYTES):
+                return held.entry(name)
+            # Anything else under that name — a symlink, a FIFO, somebody
+            # else's file — is taken out and the cover fetched again.
+            unlink_at(held, name)
+        status, blob, _ = http_raw("GET", url, timeout=ART_TIMEOUT, limit=ART_MAX_BYTES)
+        if status != 200 or not blob:
+            return ""
+        write_file_at(held, name, blob, 0o600)
+        return held.entry(name)
+    except Exception:
+        return ""
+
+
+def cache_art(items):
+    """Fill `artPath` on every dict in `items` (recursing one level into `items`
+    lists) by downloading their `art` URLs concurrently."""
+    targets = []
+
+    def collect(obj):
+        if isinstance(obj, dict):
+            if obj.get("art") and not obj.get("artPath"):
+                targets.append(obj)
+            for value in obj.values():
+                if isinstance(value, (list, dict)):
+                    collect(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                collect(value)
+
+    collect(items)
+    if not targets:
+        return items
+    urls = sorted({t["art"] for t in targets})
+    with ThreadPoolExecutor(max_workers=ART_WORKERS) as pool:
+        paths = dict(zip(urls, pool.map(cache_one, urls)))
+    for target in targets:
+        target["artPath"] = paths.get(target["art"], "")
+    return items
+
+
+
+
+# -------------------------------------------------------------- normalizers
+
+def as_int(value):
+    try:
+        return max(0, int(float(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def text(value, limit=300):
+    s = " ".join(str(value or "").split())
+    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
+
+
+def norm_episode(e, podcast_uuid="", podcast_title="", sync=None):
+    """One episode in the shape every list and the player share. Times are in
+    whole seconds; `status` is Pocket Casts' playingStatus (1 unplayed,
+    2 in progress, 3 played)."""
+    if not isinstance(e, dict):
+        return None
+    uuid = str(e.get("uuid") or "").lower()
+    if not UUID_RE.match(uuid):
+        return None
+    sync = sync if isinstance(sync, dict) else {}
+    podcast = str(e.get("podcastUuid") or e.get("podcast") or podcast_uuid or "").lower()
+    if not UUID_RE.match(podcast):
+        podcast = ""
+    duration = as_int(e.get("duration")) or as_int(sync.get("duration"))
+    played = as_int(e.get("playedUpTo")) or as_int(sync.get("playedUpTo"))
+    status = as_int(e.get("playingStatus")) or as_int(sync.get("playingStatus"))
+    if status == 0:
+        status = STATUS_IN_PROGRESS if played > 0 else STATUS_UNPLAYED
+    return {
+        "type": "episode",
+        "uuid": uuid,
+        "podcast": podcast,
+        "show": text(e.get("podcastTitle") or podcast_title, 200),
+        "name": text(e.get("title"), 300) or "Untitled episode",
+        "url": safe_media_url(e.get("url")),
+        "published": str(e.get("published") or "")[:32],
+        "duration": duration,
+        "playedUpTo": played,
+        "status": status,
+        "starred": e.get("starred") is True,
+        "art": podcast_art(podcast),
+    }
+
+
+def norm_podcast(p):
+    if not isinstance(p, dict):
+        return None
+    uuid = str(p.get("uuid") or "").lower()
+    if not UUID_RE.match(uuid):
+        return None
+    return {
+        "type": "podcast",
+        "uuid": uuid,
+        "name": text(p.get("title"), 200) or "Untitled show",
+        "author": text(p.get("author"), 200),
+        "lastPublished": str(p.get("lastEpisodePublished") or "")[:32],
+        "unplayed": p.get("unplayed") is True,
+        "art": podcast_art(uuid),
+    }
+
+
+# ---------------------------------------------------------------- library
+
+PODCASTS_CACHE_SECONDS = 600
+
+
+def subscriptions(force=False):
+    """Your shows, newest episode first. Kept for ten minutes in the state
+    directory so Up Next and the player can name an episode's show."""
+    cached = {} if force else load_state("podcasts-cache.json", 4 * 1024 * 1024)
+    if cached and time.time() - float(cached.get("at") or 0) < PODCASTS_CACHE_SECONDS and isinstance(cached.get("items"), list):
+        return cached["items"]
+    payload = api("/user/podcast/list", {"v": 1})
+    items = [p for p in (norm_podcast(x) for x in payload.get("podcasts") or []) if p]
+    items.sort(key=lambda p: p.get("lastPublished") or "", reverse=True)
+    try:
+        save_state("podcasts-cache.json", {"at": time.time(), "items": items})
+    except (OSError, ApiError):
+        pass
+    return items
+
+
+def podcast_titles():
+    try:
+        return {p["uuid"]: p["name"] for p in subscriptions()}
+    except ApiError:
+        return {}
+
+
+def up_next_raw():
+    payload = api("/up_next/list", {"version": 2, "model": "webplayer", "serverModified": 0, "showPlayStatus": True})
+    sync = {}
+    for s in payload.get("episodeSync") or []:
+        if isinstance(s, dict) and s.get("uuid"):
+            sync[str(s["uuid"]).lower()] = s
+    return payload.get("episodes") or [], sync
+
+
+def up_next_items():
+    episodes, sync = up_next_raw()
+    titles = podcast_titles()
+    items = []
+    for e in episodes:
+        item = norm_episode(e, sync=sync.get(str((e or {}).get("uuid") or "").lower()))
+        if item:
+            item["show"] = item["show"] or titles.get(item["podcast"], "")
+            items.append(item)
+    return items
+
+
+def user_episode(uuid):
+    """Everything Pocket Casts knows about one episode, including your
+    position in it; {} when it has no record (some shows you never followed)."""
+    try:
+        payload = api("/user/episode", {"uuid": safe_uuid(uuid)})
+    except ApiError as err:
+        if err.status == 404 or err.code == "bad_response":
+            return {}
+        raise
+    return payload if payload.get("uuid") else {}
+
+
+def resolve_episode(uuid, podcast_uuid=""):
+    """An episode with a playable URL: from your Pocket Casts record, or —
+    for a show you don't follow — from the show's public episode list."""
+    uuid = safe_uuid(uuid)
+    raw = user_episode(uuid)
+    item = norm_episode(raw) if raw else None
+    if item and item["url"]:
+        if not item["show"] and item["podcast"]:
+            item["show"] = podcast_titles().get(item["podcast"], "")
+        return item
+    podcast_uuid = (item or {}).get("podcast") or podcast_uuid
+    if not podcast_uuid:
+        raise ApiError("not_found", "Pocket Casts has no audio for that episode")
+    show = fetch_show(podcast_uuid)
+    for e in show.get("episodes") or []:
+        if str((e or {}).get("uuid") or "").lower() == uuid:
+            found = norm_episode(e, podcast_uuid, show.get("title"))
+            if found and found["url"]:
+                if item:
+                    found["playedUpTo"] = item["playedUpTo"]
+                    found["status"] = item["status"]
+                    found["duration"] = item["duration"] or found["duration"]
+                return found
+    raise ApiError("not_found", "Pocket Casts has no audio for that episode")
+
+
+def push_position(item, position, status=STATUS_IN_PROGRESS):
+    """Tell Pocket Casts where you are in an episode."""
+    if not item or not item.get("uuid") or not item.get("podcast"):
+        return False
+    body = {"uuid": item["uuid"], "podcast": item["podcast"], "position": int(max(0, position)), "status": status}
+    if item.get("duration"):
+        body["duration"] = int(item["duration"])
+    api("/sync/update_episode", body)
+    return True
+
+
+def up_next_episode_body(item):
+    return {"uuid": item["uuid"], "title": item.get("name", ""), "url": item.get("url", ""),
+            "podcast": item.get("podcast", ""), "published": item.get("published", "")}
+
+
+def up_next_put(item, where):
+    """Queue an episode: "now" (top of Up Next, where Pocket Casts keeps what
+    is playing), "next" or "last". Pocket Casts' web player uses play_now for
+    the first; if the server refuses it, play_next is the closest stand-in."""
+    endpoint = {"now": "/up_next/play_now", "next": "/up_next/play_next", "last": "/up_next/play_last"}[where]
+    body = {"version": 2, "episode": up_next_episode_body(item)}
+    try:
+        api(endpoint, body)
+    except ApiError as err:
+        if where == "now" and err.status in (400, 404, 405):
+            api("/up_next/play_next", body)
+        else:
+            raise
+
+
+def up_next_remove(uuids):
+    uuids = [safe_uuid(u) for u in uuids if u]
+    if uuids:
+        api("/up_next/remove", {"version": 2, "uuids": uuids})
+
+
+# ---------------------------------------------------------------------- mpv
+
+MPV_PROPERTIES = ("path", "pause", "time-pos", "duration", "volume", "speed", "eof-reached",
+                  "idle-active", "paused-for-cache")
+
+
+def runtime_dir(create=False):
+    base = clean_env_value("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR")) or "/run/user/%d" % os.geteuid()
+    return open_dir(base, ("omarchy-pocketcasts",), create)
+
+
+def socket_path(create=False):
+    with runtime_dir(create) as held:
+        return held.entry("mpv.sock")
+
+
+def mpris_script():
+    """mpv-mpris, when installed, so media keys and playerctl see the player.
+    Only a root-owned copy in the system library directory is loaded."""
+    for candidate in ("/usr/lib/mpv-mpris/mpris.so", "/usr/lib/mpv/mpris.so"):
+        try:
+            st = os.stat(candidate)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and safe_chain(os.path.realpath(candidate), (0,)):
+            return os.path.realpath(candidate)
+    return ""
+
+
+class Mpv:
+    """A connection to the plugin's mpv over its JSON IPC socket."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buffer = b""
+        self.next_id = 1
+
+    @classmethod
+    def connect(cls, timeout=2.0):
+        """The running player, or None when there isn't one. The socket must be
+        a socket you own inside the plugin's private runtime directory."""
+        try:
+            path = socket_path()
+        except FileNotFoundError:
+            return None
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.geteuid():
+            return None
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(path)
+        except OSError:
+            sock.close()
+            return None
+        return cls(sock)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def command(self, *args):
+        """Run one mpv command; returns its data, or raises ApiError."""
+        request_id = self.next_id
+        self.next_id += 1
+        line = json.dumps({"command": list(args), "request_id": request_id}) + "\n"
+        try:
+            self.sock.sendall(line.encode("utf-8"))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                while b"\n" in self.buffer:
+                    raw, self.buffer = self.buffer.split(b"\n", 1)
+                    try:
+                        reply = json.loads(raw.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    if not isinstance(reply, dict) or reply.get("request_id") != request_id:
+                        continue  # an event, or an answer to someone else
+                    if reply.get("error") not in (None, "success"):
+                        raise ApiError("player", "mpv: %s" % reply.get("error"))
+                    return reply.get("data")
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    break
+                if len(self.buffer) > 1024 * 1024:
+                    raise ApiError("player", "mpv sent too much at once")
+                self.buffer += chunk
+        except (OSError, socket.timeout) as err:
+            raise ApiError("player", "Lost the connection to mpv (%s)" % err)
+        raise ApiError("player", "mpv did not answer")
+
+    def wait_for_load(self, timeout=20.0):
+        """After a loadfile: return once mpv says the file opened, raise if it
+        says the file failed, and give up quietly (still loading a slow
+        stream) after `timeout`."""
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                while b"\n" in self.buffer:
+                    raw, self.buffer = self.buffer.split(b"\n", 1)
+                    try:
+                        event = json.loads(raw.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("event") == "file-loaded":
+                        return True
+                    if event.get("event") == "end-file" and event.get("reason") == "error":
+                        detail = str(event.get("file_error") or "unknown error")[:120]
+                        raise ApiError("playback_failed", "mpv could not play that episode (%s)" % detail)
+                self.sock.settimeout(max(0.1, deadline - time.monotonic()))
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    break
+                if len(self.buffer) > 1024 * 1024:
+                    self.buffer = b""
+                self.buffer += chunk
+        except (OSError, socket.timeout):
+            pass
+        return False
+
+    def get(self, name, default=None):
+        try:
+            return self.command("get_property", name)
+        except ApiError:
+            return default
+
+    def set(self, name, value):
+        return self.command("set_property", name, value)
+
+    def snapshot(self):
+        return {name: self.get(name) for name in MPV_PROPERTIES}
+
+
+def mpv_quote(value):
+    """mpv's length-prefixed quoting for a key=value list entry, so a title
+    holding commas or equals signs stays one value."""
+    value = str(value)
+    return "%%%d%%%s" % (len(value.encode("utf-8")), value)
+
+
+def start_mpv(prefs):
+    """Start the player detached (it outlives this script and the shell) and
+    wait for its socket. mpv runs with --no-config so nothing from ~/.config/mpv
+    — scripts, ytdl hooks, profiles — is loaded into it."""
+    mpv = trusted_tool("mpv")
+    if not mpv:
+        raise ApiError("no_mpv", "mpv is not installed — run: omarchy pkg add mpv")
+    path = socket_path(create=True)
+    try:
+        st = os.lstat(path)
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == os.geteuid():
+            os.unlink(path)  # a dead player's socket
+    except OSError:
+        pass
+    argv = [mpv, "--no-config", "--idle=yes", "--no-video", "--no-terminal", "--keep-open=yes",
+            "--ytdl=no", "--input-ipc-server=" + path, "--title=Pocket Casts",
+            "--audio-client-name=omarchy-pocketcasts", "--cache=yes", "--network-timeout=30",
+            "--user-agent=" + USER_AGENT,
+            "--volume=%d" % max(0, min(100, as_int(prefs.get("volume", 100)) if "volume" in prefs else 100)),
+            "--speed=%s" % clamp_speed(prefs.get("speed", 1.0))]
+    argv.extend(MPV_EXTRA_ARGS)
+    script = mpris_script()
+    if script:
+        argv.append("--script=" + script)
+    # Its own session, so it is nobody's child for long: the bridge exits right
+    # after this and mpv is reparented. Standard streams go to /dev/null; every
+    # other descriptor here is close-on-exec.
+    devnull = os.open(os.devnull, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        os.posix_spawn(mpv, argv, child_env(), setsid=True,
+                       file_actions=[(os.POSIX_SPAWN_DUP2, devnull, 0), (os.POSIX_SPAWN_DUP2, devnull, 1),
+                                     (os.POSIX_SPAWN_DUP2, devnull, 2)])
+    except OSError as err:
+        raise ApiError("player", "Could not start mpv (%s)" % err)
+    finally:
+        os.close(devnull)
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        player = Mpv.connect(timeout=1.0)
+        if player:
+            return player
+        time.sleep(0.1)
+    raise ApiError("player", "mpv started but its control socket never appeared")
+
+
+def ensure_mpv(prefs):
+    return Mpv.connect() or start_mpv(prefs)
+
+
+def clamp_speed(value):
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        speed = 1.0
+    return round(max(0.5, min(3.0, speed)), 2)
+
+
+# ------------------------------------------------------------ playback state
+#
+# playback.json remembers the episode loaded into mpv (so a poll can tell
+# what is playing and where to sync it), when its position was last pushed,
+# and which episode's ending was already handled.
+
+def load_playback():
+    return load_state("playback.json")
+
+
+def save_playback(state):
+    save_state("playback.json", state)
+
+
+def load_prefs():
+    return load_state("prefs.json")
+
+
+def save_prefs(prefs):
+    save_state("prefs.json", prefs)
+
+
+def chip_item(item):
+    """The fields worth keeping for the bar chip and the panel's hero."""
+    if not item:
+        return {}
+    keep = ("type", "uuid", "podcast", "show", "name", "url", "published", "duration",
+            "playedUpTo", "status", "art", "artPath")
+    return {k: item.get(k) for k in keep if k in item}
+
+
+def start_position(item, from_start=False):
+    if from_start or item.get("status") == STATUS_PLAYED:
+        return 0
+    position = as_int(item.get("playedUpTo"))
+    if item.get("duration") and position >= item["duration"] - FINISH_SLACK:
+        return 0
+    return position
+
+
+def load_into_mpv(item, prefs, position):
+    url = safe_media_url(item.get("url"))
+    if not url:
+        raise ApiError("not_found", "That episode has no playable audio link")
+    player = ensure_mpv(prefs)
+    with player:
+        title = item.get("name") or "Pocket Casts"
+        if item.get("show"):
+            title = "%s — %s" % (title, item["show"])
+        options = "start=%d,force-media-title=%s,pause=no" % (int(position), mpv_quote(title))
+        player.command("loadfile", url, "replace", -1, options)
+        player.wait_for_load()
+
+
+def play_item(item, prefs, from_start=False, queue=True):
+    """Load `item` and record it as what's playing. Pocket Casts keeps the
+    playing episode at the top of Up Next, so it goes there too."""
+    position = start_position(item, from_start)
+    previous = load_playback()
+    current = previous.get("episode") or {}
+    # Switching away mid-episode: save where you were in the old one (unless
+    # it just finished, which already marked it played).
+    if (current.get("uuid") and current.get("uuid") != item.get("uuid")
+            and previous.get("handledEnd") != current.get("uuid") and previous.get("position") is not None):
+        try:
+            push_position(current, as_int(previous.get("position")))
+        except ApiError:
+            pass
+    load_into_mpv(item, prefs, position)
+    cache_art([item])
+    state = {"episode": chip_item(item), "lastSyncAt": time.time(), "lastSyncPos": position,
+             "position": position, "handledEnd": ""}
+    save_playback(state)
+    if queue:
+        try:
+            up_next_put(item, "now")
+        except ApiError:
+            pass
+    try:
+        push_position(item, position)
+    except ApiError:
+        pass
+    return state
+
+
+def player_view(snap, state, prefs):
+    episode = state.get("episode") or {}
+    active = bool(snap) and not snap.get("idle-active") and bool(snap.get("path"))
+    duration = snap.get("duration") if active else None
+    position = snap.get("time-pos") if active else None
+    view = {
+        "active": active,
+        "playing": active and snap.get("pause") is False,
+        "buffering": active and snap.get("paused-for-cache") is True,
+        "position": float(position) if isinstance(position, (int, float)) else float(state.get("position") or episode.get("playedUpTo") or 0),
+        "duration": float(duration) if isinstance(duration, (int, float)) and duration > 0 else float(episode.get("duration") or 0),
+        "volume": int(round(snap.get("volume"))) if active and isinstance(snap.get("volume"), (int, float)) else as_int(prefs.get("volume", 100)) if "volume" in prefs else 100,
+        "speed": float(snap.get("speed")) if active and isinstance(snap.get("speed"), (int, float)) else clamp_speed(prefs.get("speed", 1.0)),
+        "item": episode or None,
+        "running": bool(snap),
+    }
+    return view
+
+
+def next_in_up_next(skip_uuid):
+    episodes, sync = up_next_raw()
+    titles = None
+    for e in episodes:
+        uuid = str((e or {}).get("uuid") or "").lower()
+        if uuid and uuid != skip_uuid:
+            item = norm_episode(e, sync=sync.get(uuid))
+            if not item:
+                continue
+            if not item["show"]:
+                titles = titles if titles is not None else podcast_titles()
+                item["show"] = titles.get(item["podcast"], "")
+            if not item["url"]:
+                item = resolve_episode(uuid, item["podcast"])
+            return item
+    return None
+
+
+def finish_current(state, prefs, autoplay):
+    """The episode reached its end: mark it played, take it off Up Next, and
+    start the next one if autoplay is on."""
+    episode = state.get("episode") or {}
+    state["handledEnd"] = episode.get("uuid", "")
+    save_playback(state)
+    try:
+        push_position(episode, episode.get("duration") or state.get("position") or 0, STATUS_PLAYED)
+        up_next_remove([episode.get("uuid")])
+    except ApiError:
+        pass
+    if not autoplay:
+        return state
+    item = next_in_up_next(episode.get("uuid", ""))
+    if not item:
+        return state
+    return play_item(item, prefs, queue=False)
+
+
+def poll(autoplay=True):
+    """Read mpv, sync the position to Pocket Casts when it's due, and handle an
+    episode that just ended. Runs under the state lock."""
+    state = load_playback()
+    prefs = load_prefs()
+    player = Mpv.connect()
+    if not player:
+        return player_view({}, state, prefs)
+    with player:
+        snap = player.snapshot()
+    episode = state.get("episode") or {}
+    url = episode.get("url") or ""
+    if not episode.get("uuid") or (snap.get("path") and snap.get("path") != url):
+        # mpv is playing something this plugin did not load (or nothing).
+        return player_view(snap, state, prefs)
+    position = snap.get("time-pos")
+    if isinstance(position, (int, float)):
+        state["position"] = float(position)
+    if snap.get("eof-reached") is True and state.get("handledEnd") != episode.get("uuid"):
+        state = finish_current(state, prefs, autoplay)
+        return poll_after_change(state, prefs)
+    now = time.time()
+    due = False
+    if snap.get("pause") is False and now - float(state.get("lastSyncAt") or 0) >= SYNC_INTERVAL:
+        due = True
+    elif snap.get("pause") is True and abs(float(state.get("position") or 0) - float(state.get("lastSyncPos") or 0)) >= 1:
+        due = True
+    if due and isinstance(position, (int, float)):
+        try:
+            push_position(episode, position)
+            state["lastSyncAt"] = now
+            state["lastSyncPos"] = float(position)
+            episode["playedUpTo"] = int(position)
+        except ApiError:
+            state["lastSyncAt"] = now  # try again next interval, not every poll
+    save_playback(state)
+    return player_view(snap, state, prefs)
+
+
+def poll_after_change(state, prefs):
+    player = Mpv.connect()
+    if not player:
+        return player_view({}, state, prefs)
+    with player:
+        return player_view(player.snapshot(), state, prefs)
+
+
+def sync_now(player, state):
+    """Push the current position right away (after a pause, seek or stop)."""
+    episode = state.get("episode") or {}
+    position = player.get("time-pos")
+    if not episode.get("uuid") or not isinstance(position, (int, float)):
+        return
+    state["position"] = float(position)
+    try:
+        push_position(episode, position)
+        state["lastSyncAt"] = time.time()
+        state["lastSyncPos"] = float(position)
+    except ApiError:
+        pass
+    save_playback(state)
+
+
+def quit_mpv(player):
+    """Ask mpv to quit and wait (briefly) until its socket stops answering, so
+    the next command starts a fresh player instead of reaching a dying one."""
+    try:
+        player.command("quit")
+    except ApiError:
+        pass
+    player.close()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        probe = Mpv.connect(timeout=0.3)
+        if not probe:
+            return
+        probe.close()
+        time.sleep(0.05)
+
+
+def require_player():
+    player = Mpv.connect()
+    if not player:
+        raise ApiError("no_player", "Nothing is playing")
+    return player
+
+
+# -------------------------------------------------------------- subcommands
+
+def cmd_status(args):
+    auth = load_auth()
+    state = load_playback()
+    episode = state.get("episode") or {}
+    if episode.get("art") and not episode.get("artPath"):
+        cache_art([episode])
+    out({
+        "authenticated": bool(auth.get("refresh_token") or auth.get("access_token")) and not auth.get("needs_reauth"),
+        "needsReauth": bool(auth.get("needs_reauth")),
+        "email": auth.get("email", ""),
+        "mpv": trusted_tool("mpv"),
+        "mpris": bool(mpris_script()),
+        "running": Mpv.connect(timeout=0.5) is not None,
+        "last": chip_item(episode),
+    })
+
+
+def read_credentials():
+    """Email and password arrive as one JSON line on stdin — never in argv,
+    where `ps` and crash reports could read them."""
+    raw = sys.stdin.buffer.read(8192)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise ApiError("bad_args", "Login details did not arrive")
+    email = str((data or {}).get("email") or "").strip()
+    password = str((data or {}).get("password") or "")
+    if not EMAIL_RE.match(email) or not password or len(password) > 1024:
+        raise ApiError("bad_args", "Enter the email and password of your Pocket Casts account")
+    return email, password
+
+
+def cmd_login(args):
+    email, password = read_credentials()
+    status, payload = post_json("/user/login_pocket_casts", {"email": email, "password": password})
+    password = None
+    if status != 200 or not payload.get("accessToken"):
+        message = error_text(payload, status)
+        if status in (400, 401, 403):
+            if str(payload.get("errorMessageId") or "").startswith("login_"):
+                message = message + ". Signed in with Apple or Google? Set a password on your Pocket Casts account first."
+            raise ApiError("login_failed", message, status)
+        raise ApiError("network", message, status)
+    auth = {}
+    store_tokens(auth, payload)
+    for name in ("podcasts-cache.json",):
+        drop_state(name)
+    out({"email": auth.get("email", email)})
+
+
+def cmd_logout(args):
+    player = Mpv.connect()
+    if player:
+        quit_mpv(player)
+    clear_auth()
+    for name in ("podcasts-cache.json", "playback.json"):
+        drop_state(name)
+    out({})
+
+
+def cmd_player(args):
+    with StateLock():
+        view = poll(autoplay=not args.no_autoplay)
+    if view.get("item") and view["item"].get("art") and not view["item"].get("artPath"):
+        cache_art([view["item"]])
+    out(view)
+
+
+def cmd_play(args):
+    uuid = safe_uuid(args.uuid)
+    podcast = safe_uuid(args.podcast) if args.podcast else ""
+    with StateLock():
+        item = resolve_episode(uuid, podcast)
+        prefs = load_prefs()
+        play_item(item, prefs, from_start=args.from_start)
+        view = poll_after_change(load_playback(), prefs)
+    out(view)
+
+
+def resume_last(prefs):
+    """Nothing is loaded (mpv was closed, or the machine restarted): pick up
+    the last episode where Pocket Casts says you left it, else the top of Up
+    Next."""
+    state = load_playback()
+    episode = state.get("episode") or {}
+    item = None
+    if episode.get("uuid") and state.get("handledEnd") != episode.get("uuid"):
+        try:
+            item = resolve_episode(episode["uuid"], episode.get("podcast", ""))
+        except ApiError:
+            item = None
+    if not item:
+        item = next_in_up_next("")
+    if not item:
+        raise ApiError("nothing_queued", "Up Next is empty — pick an episode to play")
+    play_item(item, prefs)
+
+
+def cmd_toggle(args):
+    with StateLock():
+        prefs = load_prefs()
+        state = load_playback()
+        player = Mpv.connect()
+        idle = True
+        if player:
+            with player:
+                idle = player.get("idle-active") is True or not player.get("path")
+                if not idle:
+                    if args.action == "pause" or (args.action == "toggle" and player.get("pause") is False):
+                        player.set("pause", True)
+                        sync_now(player, state)
+                    else:
+                        if player.get("eof-reached") is True:
+                            player.command("seek", 0, "absolute")
+                        player.set("pause", False)
+        if idle and args.action != "pause":
+            resume_last(prefs)
+        view = poll_after_change(load_playback(), prefs)
+    out(view)
+
+
+def cmd_seek(args):
+    with StateLock():
+        state = load_playback()
+        with require_player() as player:
+            if args.relative:
+                player.command("seek", float(args.seconds), "relative")
+            else:
+                player.command("seek", max(0.0, float(args.seconds)), "absolute")
+            time.sleep(0.05)
+            sync_now(player, state)
+        view = poll_after_change(load_playback(), load_prefs())
+    out(view)
+
+
+def cmd_volume(args):
+    prefs = load_prefs()
+    prefs["volume"] = max(0, min(100, int(args.percent)))
+    save_prefs(prefs)
+    player = Mpv.connect()
+    if player:
+        with player:
+            player.set("volume", prefs["volume"])
+    out({"volume": prefs["volume"]})
+
+
+def cmd_speed(args):
+    prefs = load_prefs()
+    if args.value == "cycle":
+        current = clamp_speed(prefs.get("speed", 1.0))
+        later = [s for s in SPEEDS if s > current + 0.001]
+        speed = later[0] if later else SPEEDS[0]
+    else:
+        speed = clamp_speed(args.value)
+    prefs["speed"] = speed
+    save_prefs(prefs)
+    player = Mpv.connect()
+    if player:
+        with player:
+            player.set("speed", speed)
+    out({"speed": speed})
+
+
+def cmd_next(args):
+    """Skip to the next Up Next episode. The skipped one keeps its position
+    and leaves Up Next, the way the Pocket Casts apps do it."""
+    with StateLock():
+        prefs = load_prefs()
+        state = load_playback()
+        episode = state.get("episode") or {}
+        player = Mpv.connect()
+        if player:
+            with player:
+                sync_now(player, state)
+        if episode.get("uuid"):
+            try:
+                up_next_remove([episode["uuid"]])
+            except ApiError:
+                pass
+        item = next_in_up_next(episode.get("uuid", ""))
+        if not item:
+            raise ApiError("nothing_queued", "Up Next is empty")
+        play_item(item, prefs, queue=False)
+        view = poll_after_change(load_playback(), prefs)
+    out(view)
+
+
+def cmd_stop(args):
+    with StateLock():
+        state = load_playback()
+        player = Mpv.connect()
+        if player:
+            sync_now(player, state)
+            quit_mpv(player)
+        view = player_view({}, load_playback(), load_prefs())
+    out(view)
+
+
+def cmd_mark(args):
+    uuid = safe_uuid(args.uuid)
+    podcast = safe_uuid(args.podcast)
+    item = {"uuid": uuid, "podcast": podcast}
+    if args.state == "played":
+        push_position(item, 0, STATUS_PLAYED)
+        try:
+            up_next_remove([uuid])
+        except ApiError:
+            pass
+    else:
+        push_position(item, 0, STATUS_UNPLAYED)
+    out({"uuid": uuid, "status": STATUS_PLAYED if args.state == "played" else STATUS_UNPLAYED})
+
+
+def cmd_queue(args):
+    uuid = safe_uuid(args.uuid)
+    if args.where == "remove":
+        up_next_remove([uuid])
+        out({"uuid": uuid})
+        return
+    item = resolve_episode(uuid, safe_uuid(args.podcast) if args.podcast else "")
+    up_next_put(item, args.where)
+    out({"uuid": uuid})
+
+
+def cmd_up_next(args):
+    items = up_next_items()[: args.limit]
+    out({"items": cache_art(items)})
+
+
+def episode_list(path):
+    payload = api(path)
+    titles = None
+    items = []
+    for e in payload.get("episodes") or []:
+        item = norm_episode(e)
+        if not item:
+            continue
+        if not item["show"]:
+            titles = titles if titles is not None else podcast_titles()
+            item["show"] = titles.get(item["podcast"], "")
+        items.append(item)
+    return items
+
+
+def cmd_in_progress(args):
+    items = episode_list("/user/in_progress")
+    items.sort(key=lambda i: i.get("published") or "", reverse=True)
+    out({"items": cache_art(items[: args.limit])})
+
+
+def cmd_new_releases(args):
+    items = episode_list("/user/new_releases")
+    items.sort(key=lambda i: i.get("published") or "", reverse=True)
+    out({"items": cache_art(items[: args.limit])})
+
+
+def cmd_podcasts(args):
+    out({"items": cache_art(subscriptions(force=args.force))})
+
+
+def cmd_episodes(args):
+    podcast_uuid = safe_uuid(args.podcast)
+    show = fetch_show(podcast_uuid)
+    try:
+        user = api("/user/podcast/episodes", {"uuid": podcast_uuid})
+    except ApiError as err:
+        if err.code in ("signed_out", "reauth"):
+            raise
+        user = {}
+    states = {}
+    for s in user.get("episodes") or []:
+        if isinstance(s, dict) and s.get("uuid"):
+            states[str(s["uuid"]).lower()] = s
+    title = show.get("title") or ""
+    items = []
+    for e in show.get("episodes") or []:
+        item = norm_episode(e, podcast_uuid, title, sync=states.get(str((e or {}).get("uuid") or "").lower()))
+        if item and not (states.get(item["uuid"]) or {}).get("isDeleted"):
+            items.append(item)
+    items.sort(key=lambda i: i.get("published") or "", reverse=True)
+    header = {"type": "podcast", "uuid": podcast_uuid, "name": text(title, 200) or "Podcast",
+              "author": text(show.get("author"), 200), "art": podcast_art(podcast_uuid)}
+    cache_art([header])
+    out({"podcast": header, "items": cache_art(items[: args.limit]), "total": len(items)})
+
+
+# --------------------------------------------------------------------- main
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="pocketcasts-bridge", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("login").set_defaults(fn=cmd_login)
+    sub.add_parser("logout").set_defaults(fn=cmd_logout)
+
+    p = sub.add_parser("player"); p.add_argument("--no-autoplay", action="store_true"); p.set_defaults(fn=cmd_player)
+    p = sub.add_parser("play"); p.add_argument("uuid"); p.add_argument("--podcast", default="")
+    p.add_argument("--from-start", action="store_true"); p.set_defaults(fn=cmd_play)
+    for action in ("toggle", "pause", "resume"):
+        sub.add_parser(action).set_defaults(fn=cmd_toggle, action=action)
+    p = sub.add_parser("seek"); p.add_argument("seconds", type=float); p.add_argument("--relative", action="store_true"); p.set_defaults(fn=cmd_seek)
+    p = sub.add_parser("volume"); p.add_argument("percent", type=int); p.set_defaults(fn=cmd_volume)
+    p = sub.add_parser("speed"); p.add_argument("value"); p.set_defaults(fn=cmd_speed)
+    sub.add_parser("next").set_defaults(fn=cmd_next)
+    sub.add_parser("stop").set_defaults(fn=cmd_stop)
+
+    p = sub.add_parser("mark"); p.add_argument("state", choices=("played", "unplayed")); p.add_argument("uuid")
+    p.add_argument("--podcast", required=True); p.set_defaults(fn=cmd_mark)
+    p = sub.add_parser("queue"); p.add_argument("where", choices=("next", "last", "remove")); p.add_argument("uuid")
+    p.add_argument("--podcast", default=""); p.set_defaults(fn=cmd_queue)
+
+    p = sub.add_parser("up-next"); p.add_argument("--limit", type=int, default=100); p.set_defaults(fn=cmd_up_next)
+    p = sub.add_parser("in-progress"); p.add_argument("--limit", type=int, default=50); p.set_defaults(fn=cmd_in_progress)
+    p = sub.add_parser("new-releases"); p.add_argument("--limit", type=int, default=50); p.set_defaults(fn=cmd_new_releases)
+    p = sub.add_parser("podcasts"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_podcasts)
+    p = sub.add_parser("episodes"); p.add_argument("podcast"); p.add_argument("--limit", type=int, default=100); p.set_defaults(fn=cmd_episodes)
+    return parser
+
+
+def main(argv):
+    scrub_environment()
+    args = build_parser().parse_args(argv)
+    try:
+        args.fn(args)
+        return 0
+    except ApiError as err:
+        fail(err.code, err.message, {"status": err.status, "retryAfter": err.retry_after})
+        return 0
+    except KeyboardInterrupt:
+        fail("cancelled", "Cancelled")
+        return 0
+    except Exception as err:  # noqa: BLE001 — surfaced to the panel as text
+        fail("internal", "%s: %s" % (type(err).__name__, err))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

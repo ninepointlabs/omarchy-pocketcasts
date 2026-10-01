@@ -1,0 +1,6 @@
+#!/bin/sh
+# Run every test: the bridge's Python suite, then the Model.js/QML node suite.
+set -eu
+cd "$(dirname "$0")/.."
+/usr/bin/python3 -I -B -m unittest discover -s tests -p 'test_*.py' "$@"
+node --test tests/model.test.cjs
