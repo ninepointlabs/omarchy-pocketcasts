@@ -7,6 +7,12 @@ shows, and keep your listening position in sync with your phone.
 Audio plays through `mpv` in the background. There's no browser and no app
 window.
 
+![The Pocket Casts panel open on the Podcasts tab](preview.png)
+
+| Up Next | In Progress | New releases |
+|---|---|---|
+| ![Up Next](preview1.png) | ![In Progress](preview2.png) | ![New releases](preview3.png) |
+
 > **Unofficial API.** Pocket Casts has no public API. This plugin uses the
 > same endpoints as the Pocket Casts web player, so it can break whenever
 > Pocket Casts changes them. It isn't affiliated with or endorsed by Pocket
