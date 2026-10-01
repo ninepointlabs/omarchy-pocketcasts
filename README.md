@@ -22,6 +22,14 @@ window.
 ## Install
 
 ```sh
+omarchy plugin add https://github.com/ninepointlabs/omarchy-pocketcasts.git --enable
+```
+
+The chip appears in the right section of the bar.
+
+To work from a checkout instead:
+
+```sh
 git clone https://github.com/ninepointlabs/omarchy-pocketcasts ~/Projects/omarchy-pocketcasts
 ~/Projects/omarchy-pocketcasts/install.sh          # adds the widget to the right of the bar
 ~/Projects/omarchy-pocketcasts/install.sh center   # or pick a section
@@ -29,6 +37,19 @@ git clone https://github.com/ninepointlabs/omarchy-pocketcasts ~/Projects/omarch
 
 Run `install.sh` again after you pull changes. If the panel doesn't pick
 them up, run `omarchy restart shell`.
+
+## Uninstall
+
+Stop playback first (the stop button, or **Sign out**, which also closes the
+player), since mpv keeps running on its own. Then:
+
+```sh
+omarchy plugin remove ninepointlabs.pocketcasts
+rm -rf ~/.local/state/omarchy-pocketcasts ~/.cache/omarchy-pocketcasts   # login tokens, playback state, cover cache
+```
+
+`mpv` and `mpv-mpris` are ordinary packages; remove them with
+`omarchy pkg remove` if nothing else uses them.
 
 ## Using it
 
